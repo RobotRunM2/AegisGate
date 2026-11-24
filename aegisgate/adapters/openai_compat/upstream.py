@@ -426,6 +426,15 @@ def _safe_error_detail(payload: dict[str, Any] | str) -> str:
     return json.dumps(payload, ensure_ascii=False)[:600]
 
 
+
+class UpstreamHttpError(RuntimeError):
+    def __init__(self, status_code: int, headers: Mapping[str, str], body: bytes) -> None:
+        self.status_code = status_code
+        self.headers = headers
+        self.body = body
+        super().__init__(f"upstream_http_error:{status_code}")
+
+
 async def _forward_json(
     url: str, payload: dict[str, Any], headers: Mapping[str, str]
 ) -> tuple[int, dict[str, Any] | str]:
@@ -446,6 +455,8 @@ async def _forward_json(
             url,
             response.status_code,
         )
+        if response.status_code >= 400:
+            raise UpstreamHttpError(response.status_code, response.headers, response.content)
         return response.status_code, _decode_json_or_text(response.content)
     except httpx.HTTPError as exc:
         detail = (str(exc) or "").strip() or "connection_failed_or_timeout"
@@ -490,6 +501,8 @@ async def _forward_multipart(
             url,
             response.status_code,
         )
+        if response.status_code >= 400:
+            raise UpstreamHttpError(response.status_code, response.headers, response.content)
         return response.status_code, _decode_json_or_text(response.content)
     except httpx.HTTPError as exc:
         detail = (str(exc) or "").strip() or "connection_failed_or_timeout"
@@ -542,6 +555,8 @@ async def _forward_multipart_pinned(
                 connect_url,
                 response.status_code,
             )
+            if response.status_code >= 400:
+                raise UpstreamHttpError(response.status_code, response.headers, response.content)
             return response.status_code, _decode_json_or_text(response.content)
         except httpx.HTTPError as exc:
             last_error = exc
@@ -653,6 +668,8 @@ async def _forward_json_pinned(
                 connect_url,
                 response.status_code,
             )
+            if response.status_code >= 400:
+                raise UpstreamHttpError(response.status_code, response.headers, response.content)
             return response.status_code, _decode_json_or_text(response.content)
         except httpx.HTTPError as exc:
             last_error = exc
@@ -696,8 +713,7 @@ async def _forward_stream_lines(
                 resp.status_code,
             )
             if resp.status_code >= 400:
-                detail = _safe_error_detail(_decode_json_or_text(await resp.aread()))
-                raise RuntimeError(f"upstream_http_error:{resp.status_code}:{detail}")
+                raise UpstreamHttpError(resp.status_code, resp.headers, await resp.aread())
             async for chunk in resp.aiter_bytes():
                 if chunk:
                     yield chunk
@@ -751,10 +767,7 @@ async def _forward_stream_lines_pinned(
                     resp.status_code,
                 )
                 if resp.status_code >= 400:
-                    detail = _safe_error_detail(
-                        _decode_json_or_text(await resp.aread())
-                    )
-                    raise RuntimeError(f"upstream_http_error:{resp.status_code}:{detail}")
+                    raise UpstreamHttpError(resp.status_code, resp.headers, await resp.aread())
                 async for chunk in resp.aiter_bytes():
                     if chunk:
                         yielded_any = True

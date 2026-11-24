@@ -9,6 +9,10 @@ each. Collapsing those into dated releases is tracked in [ROADMAP.md](ROADMAP.md
 
 ## [Unreleased]
 
+### Fixed（上游错误透传）
+
+- 上游返回 HTTP 错误时保留上游错误响应，不再将其误记为网关安全拦截；网关自身的安全拦截不受影响。
+
 ### Added（模型列表）
 
 - `GET /v1/models` 及 token 路径支持转发上游模型列表，沿用网关访问控制并转发上游鉴权头和查询参数。

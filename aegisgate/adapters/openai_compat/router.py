@@ -88,6 +88,7 @@ from aegisgate.adapters.openai_compat.stream_utils import (
     _stream_messages_message_stop_sse_chunk,
 )
 from aegisgate.adapters.openai_compat.upstream import (
+    UpstreamHttpError,
     _FORWARD_HOST_HEADER,
     _FORWARD_OVERRIDES_HEADER,
     _bound_connect_request,
@@ -106,7 +107,6 @@ from aegisgate.adapters.openai_compat.upstream import (
     _request_already_sent,
     _should_bypass_filters_for_whitelist,
     _resolve_upstream_base,
-    _safe_error_detail,
 )
 from aegisgate.config.settings import settings
 from aegisgate.config.security_rules import is_low_false_positive_route, load_security_rules
@@ -429,7 +429,7 @@ async def _prime_forward_stream(
     *,
     ctx: RequestContext,
     boundary: dict | None,
-) -> AsyncGenerator[bytes, None] | JSONResponse:
+) -> AsyncGenerator[bytes, None] | Response:
     """Take the upstream outcome before a streaming response commits its status.
 
     ``StreamingResponse`` sends the status line before the body runs, so an
@@ -442,6 +442,12 @@ async def _prime_forward_stream(
     except StopAsyncIteration:
         await _aclose_stream(stream)
         return _empty_byte_stream()
+    except UpstreamHttpError as exc:
+        await _aclose_stream(stream)
+        ctx.redaction_mapping.clear()
+        return _upstream_http_error_response(
+            exc, ctx=ctx, boundary=boundary, log_label="stream"
+        )
     except RuntimeError as exc:
         parsed = _split_upstream_http_error(str(exc))
         await _aclose_stream(stream)
@@ -482,7 +488,7 @@ async def _open_pinned_stream(
     host_header: str,
     ctx: RequestContext,
     boundary: dict | None,
-) -> AsyncGenerator[bytes, None] | JSONResponse:
+) -> AsyncGenerator[bytes, None] | Response:
     return await _prime_forward_stream(
         _iter_forward_stream_with_pinning(
             url=url,
@@ -719,6 +725,10 @@ async def _forward_json_passthrough(
             connect_urls=connect_urls,
             host_header=host_header,
         )
+    except UpstreamHttpError as exc:
+        return _upstream_http_error_response(
+            exc, ctx=ctx, boundary=boundary, log_label=log_label
+        )
     except RuntimeError as exc:
         logger.error(
             "%s upstream unreachable request_id=%s error=%s",
@@ -730,23 +740,6 @@ async def _forward_json_passthrough(
             status_code=502,
             reason="upstream_unreachable",
             detail=str(exc),
-            ctx=ctx,
-            boundary=boundary,
-        )
-
-    if status_code >= 400:
-        detail = _safe_error_detail(upstream_body)
-        logger.warning(
-            "%s upstream http error request_id=%s status=%s detail=%s",
-            log_label,
-            ctx.request_id,
-            status_code,
-            detail,
-        )
-        return _error_response(
-            status_code=status_code,
-            reason="upstream_http_error",
-            detail=detail,
             ctx=ctx,
             boundary=boundary,
         )
@@ -784,7 +777,7 @@ async def _build_passthrough_stream_response(
         ctx=ctx,
         boundary=boundary,
     )
-    if isinstance(opened, JSONResponse):
+    if isinstance(opened, Response):
         return opened
 
     async def passthrough_generator() -> AsyncGenerator[bytes, None]:
@@ -3288,6 +3281,45 @@ def _error_response(
     )
 
 
+def _upstream_http_error_response(
+    exc: UpstreamHttpError,
+    *,
+    ctx: RequestContext,
+    boundary: dict | None,
+    log_label: str,
+) -> Response:
+    """Relay an upstream HTTP error byte-for-byte, auditing it without blocking.
+
+    The body belongs to the upstream, so neither the audit record nor the log
+    line carries it: both sinks store text unredacted.
+    """
+    ctx.disposition_reasons.append("upstream_http_error")
+    ctx.enforcement_actions.append("upstream:upstream_http_error")
+    try:
+        _write_audit_event(ctx, boundary=boundary)
+    except Exception as audit_exc:  # pragma: no cover - operational guard
+        logger.warning(
+            "audit write failed on upstream error request_id=%s error=%s",
+            ctx.request_id,
+            audit_exc,
+        )
+    logger.warning(
+        "%s upstream http error request_id=%s status=%s",
+        log_label,
+        ctx.request_id,
+        exc.status_code,
+    )
+    # Lazy import: v2 owns the client-facing filter that drops hop-by-hop,
+    # content-length/content-encoding (this body is already decoded) and cookies.
+    from aegisgate.adapters.v2_proxy.router import _build_client_response_headers
+
+    return Response(
+        content=exc.body,
+        status_code=exc.status_code,
+        headers=_build_client_response_headers(exc.headers),
+    )
+
+
 def _is_payload_shape_violation_error(exc: ValueError) -> bool:
     return str(exc).strip().endswith("_shape_violation")
 
@@ -3469,7 +3501,7 @@ async def _execute_chat_stream_once(
             ctx=ctx,
             boundary=boundary,
         )
-        if isinstance(opened_bypass, JSONResponse):
+        if isinstance(opened_bypass, Response):
             return opened_bypass
 
         return stream_transport.build_bypass_stream_response(
@@ -3565,7 +3597,7 @@ async def _execute_chat_stream_once(
         ctx=ctx,
         boundary=boundary,
     )
-    if isinstance(opened, JSONResponse):
+    if isinstance(opened, Response):
         return opened
 
     async def guarded_generator() -> AsyncGenerator[bytes, None]:
@@ -4056,7 +4088,7 @@ async def _execute_responses_stream_once(
             ctx=ctx,
             boundary=boundary,
         )
-        if isinstance(opened_bypass, JSONResponse):
+        if isinstance(opened_bypass, Response):
             return opened_bypass
 
         return stream_transport.build_bypass_stream_response(
@@ -4166,7 +4198,7 @@ async def _execute_responses_stream_once(
         ctx=ctx,
         boundary=boundary,
     )
-    if isinstance(opened, JSONResponse):
+    if isinstance(opened, Response):
         return opened
 
     async def guarded_generator() -> AsyncGenerator[bytes, None]:
@@ -4579,7 +4611,7 @@ async def _execute_chat_once(
     tenant_id: str = "default",
     skip_confirmation: bool = False,
     forced_upstream_base: str | None = None,
-) -> dict | JSONResponse:
+) -> dict | JSONResponse | Response:
     req = await _run_payload_transform(to_internal_chat, payload)
     req.session_id = _derive_session_id(payload, req.request_id, request_headers)
     ctx = RequestContext(
@@ -4653,6 +4685,10 @@ async def _execute_chat_once(
                 connect_urls=connect_urls,
                 host_header=host_header,
             )
+        except UpstreamHttpError as exc:
+            return _upstream_http_error_response(
+                exc, ctx=ctx, boundary=boundary, log_label="chat completion"
+            )
         except RuntimeError as exc:
             logger.error(
                 "upstream unreachable request_id=%s error=%s", ctx.request_id, exc
@@ -4661,22 +4697,6 @@ async def _execute_chat_once(
                 status_code=502,
                 reason="upstream_unreachable",
                 detail=str(exc),
-                ctx=ctx,
-                boundary=boundary,
-            )
-
-        if status_code >= 400:
-            detail = _safe_error_detail(upstream_body)
-            logger.warning(
-                "upstream http error request_id=%s status=%s detail=%s",
-                ctx.request_id,
-                status_code,
-                detail,
-            )
-            return _error_response(
-                status_code=status_code,
-                reason="upstream_http_error",
-                detail=detail,
                 ctx=ctx,
                 boundary=boundary,
             )
@@ -4801,6 +4821,12 @@ async def _execute_chat_once(
                 connect_urls=connect_urls,
                 host_header=host_header,
             )
+        except UpstreamHttpError as exc:
+            return execution_common.Finish(
+                _upstream_http_error_response(
+                    exc, ctx=ctx, boundary=boundary, log_label="chat completion"
+                )
+            )
         except RuntimeError as exc:
             logger.error("upstream unreachable request_id=%s error=%s", ctx.request_id, exc)
             return execution_common.Finish(
@@ -4813,23 +4839,6 @@ async def _execute_chat_once(
                 )
             )
 
-        if status_code >= 400:
-            detail = _safe_error_detail(upstream_body)
-            logger.warning(
-                "upstream http error request_id=%s status=%s detail=%s",
-                ctx.request_id,
-                status_code,
-                detail,
-            )
-            return execution_common.Finish(
-                _error_response(
-                    status_code=status_code,
-                    reason="upstream_http_error",
-                    detail=detail,
-                    ctx=ctx,
-                    boundary=boundary,
-                )
-            )
         return execution_common.Continue(upstream_body)
 
     async def response_stage(upstream_body: dict[str, Any] | str):
@@ -4962,7 +4971,7 @@ async def _execute_responses_once(
     tenant_id: str = "default",
     skip_confirmation: bool = False,
     forced_upstream_base: str | None = None,
-) -> dict | JSONResponse:
+) -> dict | JSONResponse | Response:
     req = await _run_payload_transform(to_internal_responses, payload)
     req.session_id = _derive_session_id(payload, req.request_id, request_headers)
     ctx = RequestContext(
@@ -5040,6 +5049,10 @@ async def _execute_responses_once(
                 connect_urls=connect_urls,
                 host_header=host_header,
             )
+        except UpstreamHttpError as exc:
+            return _upstream_http_error_response(
+                exc, ctx=ctx, boundary=boundary, log_label="responses endpoint"
+            )
         except RuntimeError as exc:
             logger.error(
                 "upstream unreachable request_id=%s error=%s", ctx.request_id, exc
@@ -5048,22 +5061,6 @@ async def _execute_responses_once(
                 status_code=502,
                 reason="upstream_unreachable",
                 detail=str(exc),
-                ctx=ctx,
-                boundary=boundary,
-            )
-
-        if status_code >= 400:
-            detail = _safe_error_detail(upstream_body)
-            logger.warning(
-                "upstream http error request_id=%s status=%s detail=%s",
-                ctx.request_id,
-                status_code,
-                detail,
-            )
-            return _error_response(
-                status_code=status_code,
-                reason="upstream_http_error",
-                detail=detail,
                 ctx=ctx,
                 boundary=boundary,
             )
@@ -5184,6 +5181,12 @@ async def _execute_responses_once(
                 connect_urls=connect_urls,
                 host_header=host_header,
             )
+        except UpstreamHttpError as exc:
+            return execution_common.Finish(
+                _upstream_http_error_response(
+                    exc, ctx=ctx, boundary=boundary, log_label="responses endpoint"
+                )
+            )
         except RuntimeError as exc:
             logger.error(
                 "upstream unreachable request_id=%s error=%s", ctx.request_id, exc
@@ -5198,23 +5201,6 @@ async def _execute_responses_once(
                 )
             )
 
-        if status_code >= 400:
-            detail = _safe_error_detail(upstream_body)
-            logger.warning(
-                "upstream http error request_id=%s status=%s detail=%s",
-                ctx.request_id,
-                status_code,
-                detail,
-            )
-            return execution_common.Finish(
-                _error_response(
-                    status_code=status_code,
-                    reason="upstream_http_error",
-                    detail=detail,
-                    ctx=ctx,
-                    boundary=boundary,
-                )
-            )
         return execution_common.Continue(upstream_body)
 
     async def response_stage(upstream_body: dict[str, Any] | str):
@@ -5438,7 +5424,7 @@ async def _execute_messages_stream_once(
             ctx=ctx,
             boundary=boundary,
         )
-        if isinstance(opened_bypass, JSONResponse):
+        if isinstance(opened_bypass, Response):
             return opened_bypass
 
         return stream_transport.build_bypass_stream_response(
@@ -5518,7 +5504,7 @@ async def _execute_messages_stream_once(
         ctx=ctx,
         boundary=boundary,
     )
-    if isinstance(opened, JSONResponse):
+    if isinstance(opened, Response):
         return opened
 
     async def guarded_generator() -> AsyncGenerator[bytes, None]:
@@ -5908,7 +5894,7 @@ async def _execute_messages_once(
     request_path: str,
     boundary: dict | None,
     tenant_id: str = "default",
-) -> JSONResponse | PlainTextResponse:
+) -> JSONResponse | PlainTextResponse | Response:
     req = await _run_payload_transform(to_internal_messages, payload)
     req.session_id = _derive_session_id(payload, req.request_id, request_headers)
     ctx = RequestContext(
@@ -5973,6 +5959,10 @@ async def _execute_messages_once(
                 connect_urls=connect_urls,
                 host_header=host_header,
             )
+        except UpstreamHttpError as exc:
+            return _upstream_http_error_response(
+                exc, ctx=ctx, boundary=boundary, log_label="messages endpoint"
+            )
         except RuntimeError as exc:
             logger.error(
                 "messages upstream unreachable request_id=%s error=%s",
@@ -5983,15 +5973,6 @@ async def _execute_messages_once(
                 status_code=502,
                 reason="upstream_unreachable",
                 detail=str(exc),
-                ctx=ctx,
-                boundary=boundary,
-            )
-        if status_code >= 400:
-            detail = _safe_error_detail(upstream_body)
-            return _error_response(
-                status_code=status_code,
-                reason="upstream_http_error",
-                detail=detail,
                 ctx=ctx,
                 boundary=boundary,
             )
@@ -6061,6 +6042,12 @@ async def _execute_messages_once(
                 connect_urls=connect_urls,
                 host_header=host_header,
             )
+        except UpstreamHttpError as exc:
+            return execution_common.Finish(
+                _upstream_http_error_response(
+                    exc, ctx=ctx, boundary=boundary, log_label="messages endpoint"
+                )
+            )
         except RuntimeError as exc:
             logger.error(
                 "messages upstream unreachable request_id=%s error=%s",
@@ -6072,18 +6059,6 @@ async def _execute_messages_once(
                     status_code=502,
                     reason="upstream_unreachable",
                     detail=str(exc),
-                    ctx=ctx,
-                    boundary=boundary,
-                )
-            )
-
-        if status_code >= 400:
-            detail = _safe_error_detail(upstream_body)
-            return execution_common.Finish(
-                _error_response(
-                    status_code=status_code,
-                    reason="upstream_http_error",
-                    detail=detail,
                     ctx=ctx,
                     boundary=boundary,
                 )
@@ -6257,7 +6232,7 @@ async def _execute_generic_stream_once(
             ctx=ctx,
             boundary=boundary,
         )
-        if isinstance(opened_bypass, JSONResponse):
+        if isinstance(opened_bypass, Response):
             return opened_bypass
 
         async def whitelist_generator() -> AsyncGenerator[bytes, None]:
@@ -6369,7 +6344,7 @@ async def _execute_generic_stream_once(
         ctx=ctx,
         boundary=boundary,
     )
-    if isinstance(opened, JSONResponse):
+    if isinstance(opened, Response):
         return opened
 
     async def guarded_generator() -> AsyncGenerator[bytes, None]:
@@ -6569,7 +6544,7 @@ async def _execute_generic_once(
     request_path: str,
     boundary: dict | None,
     tenant_id: str = "default",
-) -> JSONResponse | PlainTextResponse:
+) -> JSONResponse | PlainTextResponse | Response:
     request_id = str(payload.get("request_id") or f"generic-{int(time.time() * 1000)}")
     session_id = _derive_session_id(payload, request_id, request_headers)
     model = str(payload.get("model") or payload.get("target_model") or "generic-model")
@@ -6638,6 +6613,10 @@ async def _execute_generic_once(
                 connect_urls=connect_urls,
                 host_header=host_header,
             )
+        except UpstreamHttpError as exc:
+            return _upstream_http_error_response(
+                exc, ctx=ctx, boundary=boundary, log_label="generic proxy"
+            )
         except RuntimeError as exc:
             logger.error(
                 "generic upstream unreachable request_id=%s error=%s",
@@ -6648,15 +6627,6 @@ async def _execute_generic_once(
                 status_code=502,
                 reason="upstream_unreachable",
                 detail=str(exc),
-                ctx=ctx,
-                boundary=boundary,
-            )
-        if status_code >= 400:
-            detail = _safe_error_detail(upstream_body)
-            return _error_response(
-                status_code=status_code,
-                reason="upstream_http_error",
-                detail=detail,
                 ctx=ctx,
                 boundary=boundary,
             )
@@ -6746,6 +6716,10 @@ async def _execute_generic_once(
             connect_urls=connect_urls,
             host_header=host_header,
         )
+    except UpstreamHttpError as exc:
+        return _upstream_http_error_response(
+            exc, ctx=ctx, boundary=boundary, log_label="generic proxy"
+        )
     except RuntimeError as exc:
         logger.error(
             "generic upstream unreachable request_id=%s error=%s", ctx.request_id, exc
@@ -6754,16 +6728,6 @@ async def _execute_generic_once(
             status_code=502,
             reason="upstream_unreachable",
             detail=str(exc),
-            ctx=ctx,
-            boundary=boundary,
-        )
-
-    if status_code >= 400:
-        detail = _safe_error_detail(upstream_body)
-        return _error_response(
-            status_code=status_code,
-            reason="upstream_http_error",
-            detail=detail,
             ctx=ctx,
             boundary=boundary,
         )
@@ -6941,7 +6905,7 @@ async def _execute_multipart_once(
     request_path: str,
     boundary: dict | None,
     tenant_id: str = "default",
-) -> JSONResponse | PlainTextResponse:
+) -> JSONResponse | PlainTextResponse | Response:
     request_id = f"multipart-{uuid.uuid4().hex[:12]}"
     token_hint = _header_lookup(request_headers, "x-aegis-token-hint")
     session_id = f"{token_hint}:{request_id}" if token_hint else request_id
@@ -7070,6 +7034,10 @@ async def _execute_multipart_once(
             connect_urls=connect_urls,
             host_header=host_header,
         )
+    except UpstreamHttpError as exc:
+        return _upstream_http_error_response(
+            exc, ctx=ctx, boundary=boundary, log_label="multipart proxy"
+        )
     except RuntimeError as exc:
         logger.error(
             "multipart upstream unreachable request_id=%s error=%s", request_id, exc
@@ -7078,16 +7046,6 @@ async def _execute_multipart_once(
             status_code=502,
             reason="upstream_unreachable",
             detail=str(exc),
-            ctx=ctx,
-            boundary=boundary,
-        )
-
-    if status_code >= 400:
-        detail = _safe_error_detail(upstream_body)
-        return _error_response(
-            status_code=status_code,
-            reason="upstream_http_error",
-            detail=detail,
             ctx=ctx,
             boundary=boundary,
         )

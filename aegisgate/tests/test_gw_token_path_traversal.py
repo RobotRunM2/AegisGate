@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from aegisgate.adapters.openai_compat import router as openai_router
+from aegisgate.adapters.openai_compat import upstream as upstream_module
 from aegisgate.adapters.openai_compat.upstream import _build_upstream_url
 from aegisgate.config.settings import settings
 from aegisgate.core import gw_tokens
@@ -174,6 +175,48 @@ def test_models_default_upstream(client: TestClient, monkeypatch) -> None:
     monkeypatch.setattr(openai_router, "_get_upstream_async_client", upstream_client)
     assert client.get("/v1/models").json() == {"data": []}
     assert client.get("/v1/other").status_code == 405
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("api/show", {"model": "m"}),
+        ("chat/completions", _CHAT),
+        ("responses", {"model": "m", "input": "hi"}),
+        ("messages", {"model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]}),
+    ],
+)
+@pytest.mark.parametrize("stream", [False, True])
+def test_upstream_error_is_relayed_without_block(
+    client: TestClient, token: str, monkeypatch, stream: bool, path: str, payload: dict
+) -> None:
+    body = b'{"error":{"message":"missing model"},"extra":42}\n'
+    audits = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            404, content=body,
+            headers={"content-type": "application/json", "x-request-id": "upstream-id"},
+        )
+
+    async def upstream_client():
+        return httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+
+    async def passthrough_pipeline(_pipeline, item, _ctx):
+        return item
+
+    monkeypatch.setattr(upstream_module, "_get_upstream_async_client", upstream_client)
+    monkeypatch.setattr(openai_router, "_run_request_pipeline", passthrough_pipeline)
+    monkeypatch.setattr(openai_router, "write_audit", audits.append)
+    response = client.post(
+        f"/v1/__gw__/t/{token}/{path}",
+        json={**payload, "stream": stream},
+    )
+    assert response.status_code == 404
+    assert response.content == body
+    assert response.headers["content-type"] == "application/json"
+    assert response.headers["x-request-id"] == "upstream-id"
+    assert audits[-1]["response_disposition"] != "block"
 
 
 @pytest.mark.parametrize(
