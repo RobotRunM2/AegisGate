@@ -11,8 +11,9 @@ import time
 import uuid
 from functools import lru_cache
 from typing import Any, AsyncGenerator, Generator, Mapping
+import httpx
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from starlette.datastructures import UploadFile
 
 from aegisgate.adapters.openai_compat.mapper import (
@@ -89,9 +90,11 @@ from aegisgate.adapters.openai_compat.stream_utils import (
 from aegisgate.adapters.openai_compat.upstream import (
     _FORWARD_HOST_HEADER,
     _FORWARD_OVERRIDES_HEADER,
+    _bound_connect_request,
     _build_forward_headers,
     _build_upstream_url,
     _effective_gateway_headers,
+    _get_upstream_async_client,
     _header_value,
     decode_forward_overrides,
     _forward_json,
@@ -7093,6 +7096,41 @@ async def _execute_multipart_once(
     if isinstance(upstream_body, dict):
         return JSONResponse(status_code=status_code, content=upstream_body)
     return PlainTextResponse(status_code=status_code, content=str(upstream_body))
+
+@router.get("/models")
+async def list_models(request: Request):
+    headers = _effective_gateway_headers(request)
+    try:
+        base, connect_bases, host_header = await _resolve_upstream_base(headers)
+        path = _request_target_path(request, fallback_path="/v1/models")
+        urls = _build_connect_urls_for_path(path, connect_bases) or (
+            _build_upstream_url(path, base),
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": "invalid_upstream_base", "detail": str(exc)})
+
+    client = await _get_upstream_async_client()
+    for index, url in enumerate(urls):
+        forward_headers = _build_forward_headers(headers)
+        extensions = None
+        if connect_bases:
+            forward_headers, extensions = _bound_connect_request(
+                forward_headers, host_header=host_header, connect_url=url
+            )
+        try:
+            upstream = await client.get(url, headers=forward_headers, extensions=extensions)
+            return Response(
+                content=upstream.content,
+                status_code=upstream.status_code,
+                media_type=upstream.headers.get("content-type"),
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            if index + 1 < len(urls):
+                continue
+        except httpx.HTTPError:
+            pass
+        return JSONResponse(status_code=502, content={"error": "upstream_unreachable"})
+
 
 
 @router.post("/chat/completions")

@@ -9,6 +9,10 @@ each. Collapsing those into dated releases is tracked in [ROADMAP.md](ROADMAP.md
 
 ## [Unreleased]
 
+### Added（模型列表）
+
+- `GET /v1/models` 及 token 路径支持转发上游模型列表，沿用网关访问控制并转发上游鉴权头和查询参数。
+
 ### Changed（CI 质量门禁）
 
 - **覆盖率低于 75% 现在会让构建失败。** `fail_under` 从 50 调到 75，覆盖率检查不再

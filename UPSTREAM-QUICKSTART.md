@@ -67,6 +67,9 @@ curl -X POST http://127.0.0.1:18080/__gw__/register \
 
 客户端使用返回的 token：`http://<网关IP>:18080/v1/__gw__/t/<token>`
 
+支持通过该 Base URL 获取模型列表：`GET http://<网关IP>:18080/v1/__gw__/t/<token>/models`。
+请求需携带上游 API Key（例如 `Authorization: Bearer <API_KEY>`）；网关会将鉴权头和查询参数转发给上游。
+
 也可以直接编辑 `config/gw_tokens.json`（参考 `config/gw_tokens.json.example`）：
 
 ```json

@@ -129,7 +129,6 @@ class TestZeroChangeSnapshot:
 
     SNAPSHOT = (
         ("GET", "/foo", 404, '{"detail":"Not Found"}'),
-        ("GET", "/v1/models", 405, '{"detail":"Method Not Allowed"}'),
         ("OPTIONS", "/health", 405, '{"detail":"Method Not Allowed"}'),
         ("GET", "/__fwd__/x", 404, '{"detail":"Not Found"}'),
         # Any method, not only the seven the forward face serves.

@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
@@ -122,6 +123,57 @@ def _install_chat_capture(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(openai_router, "_write_audit_event", lambda *args, **kwargs: None)
     monkeypatch.setattr(openai_router, "debug_log_original", lambda *args, **kwargs: None)
     return captured
+
+@pytest.mark.parametrize("status", [200, 401])
+def test_models_forwarding(client: TestClient, token: str, monkeypatch, status: int) -> None:
+    requests = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(status, json={"data": [{"id": "model-a"}]})
+
+    async def upstream_client():
+        return httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+
+    monkeypatch.setattr(openai_router, "_get_upstream_async_client", upstream_client)
+    response = client.get(
+        f"/v1/__gw__/t/{token}/models?limit=5",
+        headers={"Authorization": "Bearer upstream-key", "x-aegis-test": "secret"},
+    )
+    assert response.status_code == status
+    assert response.json() == {"data": [{"id": "model-a"}]}
+    assert str(requests[0].url) == f"{_UPSTREAM}/models?limit=5"
+    assert requests[0].method == "GET"
+    assert requests[0].headers["authorization"] == "Bearer upstream-key"
+    assert "x-aegis-test" not in requests[0].headers
+    assert client.get("/v1/__gw__/t/not-a-token/models").status_code in (401, 403, 404)
+    assert len(requests) == 1
+
+
+def test_models_unreachable(client: TestClient, token: str, monkeypatch) -> None:
+    def upstream(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("unreachable", request=request)
+
+    async def upstream_client():
+        return httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+
+    monkeypatch.setattr(openai_router, "_get_upstream_async_client", upstream_client)
+    assert client.get(f"/v1/__gw__/t/{token}/models").status_code == 502
+
+
+def test_models_default_upstream(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "upstream_base_url", _UPSTREAM)
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == f"{_UPSTREAM}/models"
+        return httpx.Response(200, json={"data": []})
+
+    async def upstream_client():
+        return httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+
+    monkeypatch.setattr(openai_router, "_get_upstream_async_client", upstream_client)
+    assert client.get("/v1/models").json() == {"data": []}
+    assert client.get("/v1/other").status_code == 405
 
 
 @pytest.mark.parametrize(
